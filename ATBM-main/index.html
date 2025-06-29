@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Secure Chat UI</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.1.1/crypto-js.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jsrsasign/10.8.6/jsrsasign-all-min.js"></script>
+  <style>
+    #chat-box {
+      height: 400px;
+      overflow-y: scroll;
+      border: 1px solid #ccc;
+      padding: 10px;
+      background-color: #f8f9fa;
+    }
+    .message.you { text-align: right; }
+    .message.other { text-align: left; }
+    .bubble {
+      display: inline-block;
+      padding: 10px;
+      border-radius: 15px;
+      margin: 5px 0;
+      max-width: 70%;
+    }
+    .bubble.you { background-color: #d1e7dd; }
+    .bubble.other { background-color: #cfe2ff; }
+    .plaintext { font-size: 0.85em; color: #555; }
+  </style>
+</head>
+<body>
+  <div class="container mt-4">
+    <h3 class="text-center">🔐 Secure Chat</h3>
+    <div id="chat-box" class="mb-3 rounded"></div>
+    <div class="input-group">
+      <input id="message-input" class="form-control" placeholder="Type your message..." />
+      <button class="btn btn-primary" onclick="sendMessage()">Send</button>
+    </div>
+  </div>
+
+  <script>
+    const ws = new WebSocket("ws://172.16.3.75:8765");
+    const chatBox = document.getElementById("chat-box");
+    const username = prompt("Enter your name:");
+
+    // Dán PEM thật của bạn vào đây (copy từ server_public.pem)
+    const serverPublicKeyPEM = `-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnCQiXUF9l2yYvHGlmxfm
+RQbHSzbxJWouoInQFdfuS2XubCXxZlL1Ei7G5DK+LWTBASZMAyIHJP8v9YOMpzQH
+VBXKFYs8pa2GTlA6u8U3dBzXVzReUX7hoIMZJmtEnmUArtg7JUUlhlNVALGH+6//
+e/gXpdw5LdKE4QCsfIsp/1V9conr5dR7Q94GQIEWs6WdPCJGEDCyGjNqgJArkMMN
+Cdtb8KwP4KiMrKTdIgxVK53OemljU3rwjlExXb8X+GM1LziEPTYGqR11kA+A9eEw
+Ug36toUY8rl8V9AW9s3xMlszthckIeoolwS3T0LR34MuSE6WHoqnb+THnS2bgYcp
+QwIDAQAB
+-----END PUBLIC KEY-----`;
+
+    // Hàm kiểm tra hash toàn vẹn
+    function verifyHash(iv_b64, cipher_b64, hash_hex) {
+      const iv = CryptoJS.enc.Base64.parse(iv_b64);
+      const cipher = CryptoJS.enc.Base64.parse(cipher_b64);
+      const concat = iv.clone().concat(cipher);
+      const hash = CryptoJS.SHA256(concat).toString(CryptoJS.enc.Hex);
+      return hash === hash_hex;
+    }
+
+    // Hàm xác thực chữ ký RSA
+    function verifySignature(sender, signature_b64) {
+      const sig = new KJUR.crypto.Signature({alg: "SHA256withRSA"});
+      sig.init(serverPublicKeyPEM);
+      sig.updateString(`${sender}-session01`);
+      const signature_hex = CryptoJS.enc.Base64.parse(signature_b64).toString(CryptoJS.enc.Hex);
+      return sig.verify(signature_hex);
+    }
+
+    // Hàm giải mã TripleDES (key, iv, ciphertext đều là base64)
+    function decryptTripleDES(ciphertext_b64, key_b64, iv_b64) {
+      const key = CryptoJS.enc.Base64.parse(key_b64);
+      const iv = CryptoJS.enc.Base64.parse(iv_b64);
+      const ciphertext = CryptoJS.enc.Base64.parse(ciphertext_b64);
+
+      const decrypted = CryptoJS.TripleDES.decrypt(
+        { ciphertext: ciphertext },
+        key,
+        { iv: iv, mode: CryptoJS.mode.CBC, padding: CryptoJS.pad.Pkcs7 }
+      );
+      return decrypted.toString(CryptoJS.enc.Utf8);
+    }
+
+    function addMessage(sender, cipher, plaintext, status) {
+      const isYou = sender === username;
+      const messageEl = document.createElement("div");
+      messageEl.className = "message " + (isYou ? "you" : "other");
+
+      const bubble = document.createElement("div");
+      bubble.className = "bubble " + (isYou ? "you" : "other");
+      bubble.innerHTML = `
+        <strong>${sender}</strong> <span style="font-size:0.8em">${status}</span><br/>
+        <div><code>${cipher}</code></div>
+        <div class="plaintext">🟢 ${plaintext}</div>
+      `;
+
+      messageEl.appendChild(bubble);
+      chatBox.appendChild(messageEl);
+      chatBox.scrollTop = chatBox.scrollHeight;
+    }
+
+    function sendMessage() {
+      const input = document.getElementById("message-input");
+      const message = input.value.trim();
+      if (message !== "") {
+        ws.send(JSON.stringify({ sender: username, message }));
+        input.value = "";
+      }
+    }
+
+    ws.onmessage = (event) => {
+      console.log("Received:", event.data); // log dữ liệu server gửi về
+
+      const data = JSON.parse(event.data);
+      const sender = data.sender;
+      const cipher = data.cipher;
+      let plaintext = "[Encrypted]";
+      let status = "";
+
+      // Kiểm tra hash toàn vẹn
+      const hashOk = verifyHash(data.iv, data.cipher, data.hash);
+
+      // Xác thực chữ ký RSA
+      let sigOk = false;
+      try {
+        sigOk = verifySignature(sender, data.signature);
+      } catch (e) {
+        console.error("Signature verify error:", e);
+        sigOk = false;
+      }
+
+      if (hashOk && sigOk && data.iv && data.cipher) {
+        try {
+          if (data.des3_key_clear) {
+            plaintext = decryptTripleDES(data.cipher, data.des3_key_clear, data.iv);
+          } else {
+            plaintext = "[Không có key giải mã]";
+          }
+          status = "<span style='color:green'>[OK]</span>";
+          ws.send(JSON.stringify({ type: "ACK", sender: username }));
+        } catch (e) {
+          plaintext = "[Giải mã lỗi]";
+          status = "<span style='color:red'>[Decrypt Error]</span>";
+          ws.send(JSON.stringify({ type: "NACK", sender: username, reason: "Decrypt Error" }));
+        }
+      } else {
+        plaintext = "[Integrity or Signature Failed]";
+        status = "<span style='color:red'>[NACK]</span>";
+        ws.send(JSON.stringify({ type: "NACK", sender: username, reason: "Integrity or Signature Failed" }));
+      }
+
+      addMessage(sender, cipher, plaintext, status);
+    };
+
+    document.getElementById("message-input").addEventListener("keydown", function(event) {
+      if (event.key === "Enter") {
+        sendMessage();
+      }
+    });
+  </script>
+</body>
+</html>
